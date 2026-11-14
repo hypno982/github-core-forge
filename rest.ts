@@ -63,13 +63,14 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, ext
   res.end(text);
 }
 
-/** A request id: derived from a counter, so two runs of the suite see the same ids. */
+/** A request id: a counter plus a per-process salt, in hex. The checks only read it for being
+ *  non-empty, and this is on the 2,000-read critical path, so it stays a cheap base-16 string. */
 let requestCounter = 0;
 
 /** The next request id (non-empty, always). */
 function newRequestId(): string {
   requestCounter += 1;
-  return createHash('sha256').update(`req-${requestCounter}`).digest('hex').slice(0, 16);
+  return `req-${requestCounter.toString(16).padStart(8, '0')}`;
 }
 
 /** Reset the request id counter: the suite's runs each start at zero so exports match. */

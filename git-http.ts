@@ -18,6 +18,11 @@ import { EMPTY_TREE_SHA, Store, objectSha, parseTree, type CommitInfo, type ObjK
 const PKT_MAX = 65520;
 /** The all-zero object id: an unborn branch's old/new value. */
 const ZERO = '0'.repeat(40);
+
+/** `DEBUG=1` in the environment turns the trace lines on; off by default, since they cost on the
+ *  benchmark's critical path (200 pushes, 2000 reads). */
+const DEBUG = process.env.DEBUG === '1';
+
 /** The side-band-64k channel that carries packfile bytes. */
 const BAND_DATA = 1;
 const BAND_PROGRESS = 2;
@@ -447,15 +452,17 @@ function serveFetchV2(store: Store, repo: NonNullable<ReturnType<Store['repo']>>
     out.push(flush());
   }
 
-  // Section: packfile. Sideband packets carry the raw pack bytes on band 1.
-  process.stderr.write(`DEBUG fetch: wants=${wants.length} haves=${haves.length} selected=${selected.size} store=${store.objects.size}\n`);
-  for (const want of wants) {
-    const ci = repo.commits.get(want);
-    process.stderr.write(`DEBUG want=${want.slice(0,8)} commitKnown=${!!ci} tree=${ci?.tree?.slice(0,8)}\n`);
-    if (ci) {
-      const tobj = store.get(ci.tree);
-      process.stderr.write(`DEBUG   treeObj=${tobj ? tobj.kind : 'MISSING'} bytes=${tobj?.body.length ?? 0}\n`);
-      for (const e of store.flatTree(ci.tree)) process.stderr.write(`DEBUG   file ${e.path} ${e.sha.slice(0,8)}\n`);
+  // The packfile. Debug lines are behind an env flag: the benchmark times 200 pushes, and a write per
+  // object is measurable on the critical path.
+  if (DEBUG) {
+    for (const want of wants) {
+      const ci = repo.commits.get(want);
+      process.stderr.write(`DEBUG want=${want.slice(0, 8)} commitKnown=${!!ci} tree=${ci?.tree?.slice(0, 8)}\n`);
+      if (ci) {
+        const tobj = store.get(ci.tree);
+        process.stderr.write(`DEBUG   treeObj=${tobj ? tobj.kind : 'MISSING'} bytes=${tobj?.body.length ?? 0}\n`);
+        for (const e of store.flatTree(ci.tree)) process.stderr.write(`DEBUG   file ${e.path} ${e.sha.slice(0, 8)}\n`);
+      }
     }
   }
   // Every tree the selection names must itself be selected: a pack that carries a tree naming an
@@ -477,7 +484,7 @@ function serveFetchV2(store: Store, repo: NonNullable<ReturnType<Store['repo']>>
     if (!added) break;
   }
   const pack = buildPack(store, selected);
-  process.stderr.write(`DEBUG fetch: pack=${pack.length} bytes\n`);
+  if (DEBUG) process.stderr.write(`DEBUG fetch: wants=${wants.length} haves=${haves.length} selected=${selected.size} pack=${pack.length}\n`);
   out.push(delim(), pkt('packfile\n'));
   out.push(...sideband(BAND_DATA, pack));
   out.push(flush());
@@ -823,11 +830,11 @@ function serveReceive(store: Store, repo: NonNullable<ReturnType<Store['repo']>>
     if (m) commands.push({ old: m[1], new: m[2], ref: m[3] });
   }
   const pack = body.subarray(at);
-  process.stderr.write(`DEBUG readPack: body=${body.length} pack=${pack.length} commands=${commands.length}\n`);
+  if (DEBUG) process.stderr.write(`DEBUG readPack: body=${body.length} pack=${pack.length} commands=${commands.length}\n`);
 
   // Take every object the pack holds, so a push can reference them afterwards.
   const objects = readPack(store, pack);
-  process.stderr.write(`DEBUG readPack: got ${objects.length} objects (${objects.map(o=>o.kind).join(',')})\n`);
+  if (DEBUG) process.stderr.write(`DEBUG readPack: got ${objects.length} objects (${objects.map((o) => o.kind).join(',')})\n`);
   for (const object of objects) {
     if (!store.objects.has(object.sha)) store.objects.set(object.sha, { kind: object.kind, body: object.body });
   }
@@ -838,23 +845,23 @@ function serveReceive(store: Store, repo: NonNullable<ReturnType<Store['repo']>>
     repo.commits.set(object.sha, info);
   }
 
-  // A pushed tree may name subtrees the pack also carried; walk them all so the store is closed
-  // under tree entries (otherwise a later fetch cannot reach a nested blob).
+  // A pushed tree may name subtrees the pack also carried; walk from the pack's own trees so the store
+  // is closed under tree entries (otherwise a later fetch cannot reach a nested blob). Walking the
+  // pack, not the whole store, is what keeps a push O(new objects): the benchmark pushes 200 times into
+  // one repository, and a full-store scan per push turns that into O(n^2).
   if (pack.length > 20) {
-    for (let pass = 0; pass < 8; pass += 1) {
-      let added = false;
-      for (const [sha, object] of [...store.objects.entries()]) {
-        if (object.kind !== 'tree') continue;
-        for (const entry of parseTree(object.body)) {
-          if (store.objects.has(entry.sha)) continue;
-          const found = objects.find((candidate) => candidate.sha === entry.sha);
-          if (found) {
-            store.objects.set(found.sha, { kind: found.kind, body: found.body });
-            added = true;
-          }
-        }
+    const available = new Map<string, { kind: ObjKind; body: Buffer }>();
+    for (const object of objects) available.set(object.sha, { kind: object.kind, body: object.body });
+    const queue: { kind: ObjKind; body: Buffer }[] = objects.filter((object) => object.kind === 'tree');
+    for (let at = 0; at < queue.length; at += 1) {
+      const tree = queue[at];
+      for (const entry of parseTree(tree.body)) {
+        if (store.objects.has(entry.sha)) continue;
+        const found = available.get(entry.sha);
+        if (!found) continue;
+        store.objects.set(found.sha, found);
+        if (found.kind === 'tree') queue.push(found);
       }
-      if (!added) break;
     }
   }
 
